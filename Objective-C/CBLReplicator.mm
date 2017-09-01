@@ -6,6 +6,7 @@
 //  Copyright © 2017 Couchbase. All rights reserved.
 //
 
+#import "CBLReplicator+Backgrounding.h"
 #import "CBLReplicator+Internal.h"
 #import "CBLReplicatorChange+Internal.h"
 #import "CBLReplicatorConfiguration.h"
@@ -50,24 +51,23 @@ static NSTimeInterval retryDelay(unsigned retryCount) {
 @end
 
 
-@interface CBLReplicator ()
-@property (readwrite, nonatomic) CBLReplicatorStatus* status;
-@end
-
-
 @implementation CBLReplicator
 {
-    dispatch_queue_t _dispatchQueue;
     C4Replicator* _repl;
     NSString* _desc;
     C4ReplicatorStatus _rawStatus;
     unsigned _retryCount;
     CBLReachability* _reachability;
     NSMutableSet* _changeListeners;
+    BOOL _isStopping;
+    BOOL _isSuspending;
 }
 
+@synthesize dispatchQueue=_dispatchQueue;
 @synthesize config=_config;
 @synthesize status=_status;
+@synthesize bgMonitor=_bgMonitor;
+@synthesize suspended=_suspended;
 
 
 + (void) initialize {
@@ -118,20 +118,23 @@ static NSTimeInterval retryDelay(unsigned retryCount) {
 
 
 - (void) start {
-    if (_repl) {
-        CBLWarn(Sync, @"%@ has already started", self);
-        return;
-    }
-    
-    CBLLog(Sync, @"%@: Starting", self);
-    _retryCount = 0;
-    [self _start];
+    dispatch_async(self.dispatchQueue, ^{
+        if (_repl) {
+            CBLWarn(Sync, @"%@ has already started", self);
+            return;
+        }
+        
+        CBLLog(Sync, @"%@: Starting", self);
+        _retryCount = 0;
+        [self _start];
+    });
 }
 
 
 - (void) retry {
     if (_repl || _rawStatus.level != kC4Offline)
         return;
+    
     CBLLog(Sync, @"%@: Retrying...", self);
     [self _start];
 }
@@ -186,6 +189,12 @@ static NSTimeInterval retryDelay(unsigned retryCount) {
     if (_repl) {
         status = c4repl_getStatus(_repl);
         [_config.database.activeReplications addObject: self];     // keeps me from being dealloced
+        
+#if TARGET_OS_IPHONE
+        if (!_config.allowRunningInBackground)
+            [self setupBackgrounding];
+#endif
+        
     } else {
         status = {kC4Stopped, {}, err};
     }
@@ -213,10 +222,16 @@ static BOOL isPull(CBLReplicatorType type) {
 
 
 - (void) stop {
-    if (_repl)
-        c4repl_stop(_repl);     // this is async; status will change when repl actually stops
-    [_reachability stop];
-    _reachability = nil;
+    dispatch_async(self.dispatchQueue, ^{
+        if (_repl)
+            c4repl_stop(_repl);     // this is async; status will change when repl actually stops
+        
+        [_reachability stop];
+        _reachability = nil;
+        
+        _isStopping = YES;
+        _isSuspending = NO;
+    });
 }
 
 
@@ -247,6 +262,7 @@ static BOOL isPull(CBLReplicatorType type) {
     }
 }
 
+#pragma mark - Change Listener:
 
 - (id<NSObject>) addChangeListener: (void (^)(CBLReplicatorChange*))block {
     if (!_changeListeners) {
@@ -264,7 +280,44 @@ static BOOL isPull(CBLReplicatorType type) {
 }
 
 
-#pragma mark - STATUS CHANGES:
+#pragma mark - Suspend:
+
+
+- (void) setSuspended: (BOOL)suspended {
+    // This is called under _dispatchQueue by CBLReplicator+Backgrounding.m
+    if (suspended != _suspended) {
+        if (_isStopping || !_repl) {
+            CBLLog(Sync, @"%@: Ignore %@ request as the replicator is stopping or was stopped.",
+                   self, (suspended ? @"suspending" : @"resuming"));
+            _suspended = NO;
+            return;
+        }
+        
+        _suspended = suspended;
+        
+        if (_isSuspending) {
+            CBLLog(Sync, @"%@: Suspending (-> %@)", self, (suspended ? @"suspending" : @"resuming"));
+            return;
+        }
+        
+        if(_suspended) {
+            _isSuspending = YES;
+            c4repl_stop(_repl); // this is async; status will change when repl actually stops
+            CBLLog(Sync, @"%@: Suspending ...", self);
+        } else
+            [self resume];
+    }
+}
+
+
+- (void) resume {
+    Assert(_repl != nil && _rawStatus.level == kC4Offline);
+    CBLLog(Sync, @"%@: Resuming ...", self);
+    [self _start];
+}
+
+
+#pragma mark - Status Changes:
 
 
 static void statusChanged(C4Replicator *repl, C4ReplicatorStatus status, void *context) {
@@ -277,10 +330,16 @@ static void statusChanged(C4Replicator *repl, C4ReplicatorStatus status, void *c
 
 
 - (void) c4StatusChanged: (C4ReplicatorStatus)c4Status {
+    BOOL resuming = NO;
     if (c4Status.level == kC4Stopped) {
-        if ([self handleError: c4Status.error]) {
+        if (_isSuspending || [self handleError: c4Status.error]) {
             // Change c4Status to offline, so my state will reflect that, and proceed:
             c4Status.level = kC4Offline;
+            
+            if (_isSuspending) {
+                resuming = !_suspended;
+                _isSuspending = NO;
+            }
         }
     } else if (c4Status.level > kC4Connecting) {
         _retryCount = 0;
@@ -302,8 +361,17 @@ static void statusChanged(C4Replicator *repl, C4ReplicatorStatus status, void *c
     // If Stopped:
     if (c4Status.level == kC4Stopped) {
         // Stopped:
+#if TARGET_OS_IPHONE
+        [self endBackgrounding];
+#endif
+        _suspended = NO;
+        _isStopping = NO;
+        
         [self clearRepl];
         [_config.database.activeReplications removeObject: self];      // this is likely to dealloc me
+    } else {
+        if (resuming)
+            [self resume];
     }
 }
 

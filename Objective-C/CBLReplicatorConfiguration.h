@@ -77,6 +77,11 @@ typedef enum {
  */
 @property (nonatomic, nullable) NSArray<NSString*>* documentIDs;
 
+
+#if TARGET_OS_IPHONE
+@property (nonatomic) BOOL allowRunningInBackground;
+#endif
+
 /**
   Creates a CBLReplicatorConfiguration with the given local database and remote database URL.
  */
